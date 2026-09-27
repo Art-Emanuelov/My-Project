@@ -1,0 +1,35 @@
+name: Train Neuroevolution
+
+on:
+  workflow_dispatch:
+    inputs:
+      generations:
+        description: 'Сколько поколений'
+        required: true
+        default: '10000'
+      checkpoint_every:
+        description: 'Чекпоинт каждые N поколений'
+        required: true
+        default: '1000'
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run training
+        run: node train.js ${{ github.event.inputs.generations }} ${{ github.event.inputs.checkpoint_every }}
+
+      - name: Upload genomes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: genomes
+          path: out/
+          if-no-files-found: warn
