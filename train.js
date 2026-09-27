@@ -1,4 +1,4 @@
-// train.js — оркестратор. Вся логика эволюции как была, но матчи считаются в пуле воркеров.
+// train.js — оркестратор с батчингом матчей
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -10,16 +10,19 @@ const CKPT_EVERY = parseInt(process.argv[3] || '1000', 10);
 const OUT_DIR = path.join(__dirname, 'out');
 if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
 
-// ==== CFG — всё как было, ничего не меняем ====
+// ==== CFG — не трогаем ====
 const CFG = {
   popSize: 24, matchesPerGenome: 2, elite: 4,
   mutRate: 0.05, mutPower: 0.25, tournament: 3, hofSize: 5,
   batchSize: 10, hofMatchRate: 0.2,
 };
 
-// ==== Пул воркеров ====
+// ==== Пул воркеров с батчингом ====
 const NUM_WORKERS = Math.max(1, os.cpus().length);
-console.log(`[pool] workers: ${NUM_WORKERS}`);
+// Размер пачки. Меньше = лучше балансировка, больше = меньше IPC.
+// 4 — хороший компромисс для popSize=24, K=2 (48 матчей за поколение).
+const CHUNK_SIZE = 4;
+console.log(`[pool] workers: ${NUM_WORKERS}, chunk: ${CHUNK_SIZE}`);
 
 class Pool {
   constructor(size) {
@@ -33,9 +36,9 @@ class Pool {
       this.workers.push(w);
     }
   }
-  run(gA, gB) {
+  runBatch(tasks) {
     return new Promise((resolve) => {
-      this.queue.push({ gA, gB, resolve });
+      this.queue.push({ tasks, resolve });
       this._pump();
     });
   }
@@ -47,14 +50,14 @@ class Pool {
       w.busy = true;
       w.currentResolve = task.resolve;
       const id = this.nextId++;
-      w.postMessage({ type: 'match', id, gA: task.gA, gB: task.gB });
+      w.postMessage({ type: 'batch', batchId: id, tasks: task.tasks });
     }
   }
   _onDone(w, msg) {
     w.busy = false;
     const resolve = w.currentResolve;
     w.currentResolve = null;
-    resolve(msg.result);
+    resolve(msg.results);
     this._pump();
   }
 }
@@ -146,8 +149,7 @@ async function doOneGeneration() {
   const K = CFG.matchesPerGenome;
   let winsA_gen = 0, winsB_gen = 0;
 
-  // Формируем задачи на всё поколение
-  const tasks = []; // {kind:'normal'|'hofA'|'hofB', gA, gB, refA, refB}
+  const tasks = [];
   for (let round = 0; round < K; round++) {
     const orderA = shuffle([...popA]);
     const orderB = shuffle([...popB]);
@@ -170,22 +172,33 @@ async function doOneGeneration() {
     }
   }
 
-  // Запускаем все матчи через пул
-  const results = await Promise.all(tasks.map(t => pool.run(t.gA, t.gB)));
+  // Нарезаем на пачки и раздаём воркерам
+  const chunks = [];
+  for (let i = 0; i < tasks.length; i += CHUNK_SIZE) {
+    chunks.push(tasks.slice(i, i + CHUNK_SIZE));
+  }
 
-  // Собираем результаты — точно как в оригинале
-  for (let i = 0; i < tasks.length; i++) {
-    const t = tasks[i];
-    const r = results[i];
-    if (t.kind === 'normal') {
-      winsA_gen += r.winA;
-      winsB_gen += r.winB;
-      recordMatch(t.gA, r.fitA, r.dmgA, r.winA, r.hpA, r.exploredA, fitMapA, statsA, K, true);
-      recordMatch(t.gB, r.fitB, r.dmgB, r.winB, r.hpB, r.exploredB, fitMapB, statsB, K, true);
-    } else if (t.kind === 'hofA') {
-      recordMatch(t.gA, r.fitA, r.dmgA, r.winA, r.hpA, r.exploredA, fitMapA, statsA, K, false);
-    } else if (t.kind === 'hofB') {
-      recordMatch(t.gB, r.fitB, r.dmgB, r.winB, r.hpB, r.exploredB, fitMapB, statsB, K, false);
+  const chunkResults = await Promise.all(
+    chunks.map(chunk => pool.runBatch(chunk.map(t => ({ gA: t.gA, gB: t.gB }))))
+  );
+
+  // Собираем обратно — порядок сохранён
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const chunk = chunks[ci];
+    const results = chunkResults[ci];
+    for (let j = 0; j < chunk.length; j++) {
+      const t = chunk[j];
+      const r = results[j];
+      if (t.kind === 'normal') {
+        winsA_gen += r.winA;
+        winsB_gen += r.winB;
+        recordMatch(t.gA, r.fitA, r.dmgA, r.winA, r.hpA, r.exploredA, fitMapA, statsA, K, true);
+        recordMatch(t.gB, r.fitB, r.dmgB, r.winB, r.hpB, r.exploredB, fitMapB, statsB, K, true);
+      } else if (t.kind === 'hofA') {
+        recordMatch(t.gA, r.fitA, r.dmgA, r.winA, r.hpA, r.exploredA, fitMapA, statsA, K, false);
+      } else if (t.kind === 'hofB') {
+        recordMatch(t.gB, r.fitB, r.dmgB, r.winB, r.hpB, r.exploredB, fitMapB, statsB, K, false);
+      }
     }
   }
 
